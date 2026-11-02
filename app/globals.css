@@ -47,3 +47,35 @@ a {
     color-scheme: dark;
   }
 }
+
+
+/* RentMate readability fix */
+h1,
+h2,
+h3,
+td,
+th {
+  color: #172b4d !important;
+  opacity: 1 !important;
+}
+
+main,
+main p,
+main label {
+  opacity: 1 !important;
+}
+
+main td,
+main h1,
+main h2,
+main h3 {
+  color: #172b4d !important;
+}
+
+/* Keep form fields readable */
+input,
+select,
+textarea {
+  color: #172b4d !important;
+  background-color: #ffffff !important;
+}
