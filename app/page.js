@@ -225,6 +225,12 @@ export default function HomePage() {
   const [search, setSearch] = useState("");
   const [equipmentStatus, setEquipmentStatus] = useState("all");
 
+  // MongoDB notifications
+  const [notifications, setNotifications] = useState([]);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationsError, setNotificationsError] = useState("");
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+
   const [bookingEquipmentId, setBookingEquipmentId] = useState("");
   const [bookingStartDate, setBookingStartDate] = useState("");
   const [bookingEndDate, setBookingEndDate] = useState("");
@@ -323,6 +329,91 @@ export default function HomePage() {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  const loadNotifications = useCallback(async () => {
+    setNotificationsLoading(true);
+    setNotificationsError("");
+
+    try {
+      const response = await fetch("/api/notifications", {
+        credentials: "include",
+        cache: "no-store",
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || "Could not load notifications.");
+      }
+
+      setNotifications(
+        Array.isArray(result.notifications) ? result.notifications : []
+      );
+    } catch (notificationError) {
+      console.error("Notifications loading error:", notificationError);
+      setNotificationsError(notificationError.message);
+    } finally {
+      setNotificationsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadNotifications();
+
+    // Check periodically so newly-created notifications appear without
+    // requiring the user to refresh the whole page.
+    const notificationInterval = window.setInterval(loadNotifications, 30000);
+    return () => window.clearInterval(notificationInterval);
+  }, [loadNotifications]);
+
+  async function handleMarkNotificationRead(notificationId) {
+    try {
+      const response = await fetch("/api/notifications", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ notificationId }),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || "Could not update notification.");
+      }
+
+      setNotifications((current) =>
+        current.map((item) =>
+          String(item._id) === String(notificationId)
+            ? { ...item, isRead: true }
+            : item
+        )
+      );
+    } catch (notificationError) {
+      console.error("Mark notification read error:", notificationError);
+      setNotificationsError(notificationError.message);
+    }
+  }
+
+  async function handleMarkAllNotificationsRead() {
+    try {
+      const response = await fetch("/api/notifications", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ markAllRead: true }),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || "Could not update notifications.");
+      }
+
+      setNotifications((current) =>
+        current.map((item) => ({ ...item, isRead: true }))
+      );
+    } catch (notificationError) {
+      console.error("Mark all notifications read error:", notificationError);
+      setNotificationsError(notificationError.message);
+    }
+  }
 
   async function handleLogout() {
     try {
@@ -649,7 +740,161 @@ export default function HomePage() {
               </div>
             </div>
 
-            <div style={{ display: "flex", alignItems: "center", gap: "14px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "14px", flexWrap: "wrap" }}>
+              <div style={{ position: "relative" }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNotificationsOpen((open) => !open);
+                    if (!notificationsOpen) loadNotifications();
+                  }}
+                  aria-label={`Notifications (${notifications.filter((item) => !item.isRead).length} unread)`}
+                  aria-expanded={notificationsOpen}
+                  style={{
+                    ...styles.navButton,
+                    position: "relative",
+                    minWidth: "48px",
+                    padding: "11px 14px",
+                    fontSize: "18px",
+                  }}
+                >
+                  🔔
+                  {notifications.filter((item) => !item.isRead).length > 0 && (
+                    <span
+                      style={{
+                        position: "absolute",
+                        top: "-8px",
+                        right: "-8px",
+                        minWidth: "19px",
+                        height: "19px",
+                        padding: "0 4px",
+                        borderRadius: "20px",
+                        background: "#e5484d",
+                        color: "#fff",
+                        fontSize: "11px",
+                        fontWeight: 800,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        border: "2px solid #142743",
+                      }}
+                    >
+                      {notifications.filter((item) => !item.isRead).length}
+                    </span>
+                  )}
+                </button>
+
+                {notificationsOpen && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      top: "calc(100% + 12px)",
+                      right: 0,
+                      width: "min(360px, calc(100vw - 32px))",
+                      maxHeight: "420px",
+                      overflowY: "auto",
+                      background: "#fff",
+                      color: "#14243e",
+                      border: "1px solid #dce5f3",
+                      borderRadius: "12px",
+                      boxShadow: "0 12px 32px rgba(0,0,0,0.22)",
+                      zIndex: 1000,
+                    }}
+                  >
+                    <div
+                      style={{
+                        padding: "14px 16px",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: "10px",
+                        borderBottom: "1px solid #e5ebf4",
+                      }}
+                    >
+                      <strong>Notifications</strong>
+                      <button
+                        type="button"
+                        onClick={handleMarkAllNotificationsRead}
+                        disabled={!notifications.some((item) => !item.isRead)}
+                        style={{
+                          ...styles.button,
+                          padding: "6px 9px",
+                          fontSize: "11px",
+                          opacity: notifications.some((item) => !item.isRead) ? 1 : 0.5,
+                        }}
+                      >
+                        Mark all read
+                      </button>
+                    </div>
+
+                    {notificationsError && (
+                      <div style={{ ...styles.error, margin: "10px", fontSize: "12px" }}>
+                        {notificationsError}
+                      </div>
+                    )}
+
+                    {notificationsLoading && notifications.length === 0 ? (
+                      <p style={{ ...styles.muted, padding: "14px 16px", margin: 0 }}>
+                        Loading notifications...
+                      </p>
+                    ) : notifications.length === 0 ? (
+                      <p style={{ ...styles.muted, padding: "14px 16px", margin: 0 }}>
+                        You have no notifications yet.
+                      </p>
+                    ) : (
+                      notifications.map((notification) => (
+                        <button
+                          key={notification._id}
+                          type="button"
+                          onClick={() => {
+                            if (!notification.isRead) {
+                              handleMarkNotificationRead(notification._id);
+                            }
+                          }}
+                          style={{
+                            display: "block",
+                            width: "100%",
+                            padding: "13px 16px",
+                            textAlign: "left",
+                            border: "none",
+                            borderBottom: "1px solid #edf1f7",
+                            background: notification.isRead ? "#fff" : "#eef7ff",
+                            color: "#14243e",
+                            cursor: notification.isRead ? "default" : "pointer",
+                          }}
+                        >
+                          <div style={{ display: "flex", alignItems: "center", gap: "7px" }}>
+                            {!notification.isRead && (
+                              <span
+                                style={{
+                                  width: "7px",
+                                  height: "7px",
+                                  borderRadius: "50%",
+                                  background: "#1685d1",
+                                  flexShrink: 0,
+                                }}
+                              />
+                            )}
+                            <strong style={{ fontSize: "13px" }}>
+                              {notification.title || "Notification"}
+                            </strong>
+                          </div>
+                          <div style={{ fontSize: "12px", lineHeight: 1.5, marginTop: "5px", color: "#52647c" }}>
+                            {notification.message}
+                          </div>
+                          <div style={{ fontSize: "10px", marginTop: "7px", color: "#8492a6" }}>
+                            {notification.createdAt
+                              ? new Date(notification.createdAt).toLocaleString("en-IN")
+                              : ""}
+                            {!notification.isRead ? " · Click to mark as read" : " · Read"}
+                          </div>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+
               <span style={{ fontSize: "13px" }}>
                 {user?.name || user?.email || "Loading account..."}
                 {user?.role ? ` · ${user.role}` : ""}

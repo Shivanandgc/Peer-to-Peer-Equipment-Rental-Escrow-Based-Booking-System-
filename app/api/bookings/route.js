@@ -1,7 +1,10 @@
-
 import { NextResponse } from "next/server";
 import pool from "@/lib/db";
 import { verifyAuth } from "@/lib/auth";
+import {
+  createActivityLog,
+  createNotification,
+} from "@/lib/mongo-helpers";
 
 export const runtime = "nodejs";
 
@@ -65,6 +68,7 @@ export async function GET(request) {
 // POST: Create a new booking
 export async function POST(request) {
   let connection;
+  let transactionStarted = false;
 
   try {
     const currentUser = verifyAuth(request);
@@ -144,6 +148,7 @@ export async function POST(request) {
     }
 
     const today = new Date();
+
     const todayString = [
       today.getFullYear(),
       String(today.getMonth() + 1).padStart(2, "0"),
@@ -161,18 +166,28 @@ export async function POST(request) {
     }
 
     connection = await pool.getConnection();
-    await connection.beginTransaction();
 
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    // Get equipment details and its owner's user ID
     const [equipmentRows] = await connection.execute(
-      `SELECT equipment_id, price_per_day, availability_status
-       FROM Equipment
-       WHERE equipment_id = ?
+      `SELECT
+          e.equipment_id,
+          e.price_per_day,
+          e.availability_status,
+          op.user_id AS owner_user_id
+       FROM Equipment e
+       LEFT JOIN Owner_Profile op
+         ON e.owner_id = op.owner_id
+       WHERE e.equipment_id = ?
        FOR UPDATE`,
       [equipmentId]
     );
 
     if (equipmentRows.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         { success: false, message: "Equipment not found." },
@@ -186,6 +201,7 @@ export async function POST(request) {
       String(equipment.availability_status).toLowerCase() !== "available"
     ) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -196,6 +212,7 @@ export async function POST(request) {
       );
     }
 
+    // Check for overlapping bookings
     const [conflicts] = await connection.execute(
       `SELECT booking_id
        FROM Booking
@@ -208,6 +225,7 @@ export async function POST(request) {
 
     if (conflicts.length > 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -218,6 +236,7 @@ export async function POST(request) {
       );
     }
 
+    // Find or create renter profile
     const [profiles] = await connection.execute(
       `SELECT renter_id
        FROM Renter_Profile
@@ -241,16 +260,17 @@ export async function POST(request) {
       renterId = profileResult.insertId;
     }
 
+    // Calculate rental amount
     const start = Date.parse(`${startDate}T00:00:00Z`);
     const end = Date.parse(`${endDate}T00:00:00Z`);
 
-    const rentalDays = Math.floor(
-      (end - start) / 86400000
-    ) + 1;
+    const rentalDays =
+      Math.floor((end - start) / 86400000) + 1;
 
     const totalAmount =
       Number(equipment.price_per_day) * rentalDays;
 
+    // Insert booking into MySQL
     const [bookingResult] = await connection.execute(
       `INSERT INTO Booking
        (equipment_id, renter_id, start_date, end_date, total_amount, status)
@@ -264,14 +284,61 @@ export async function POST(request) {
       ]
     );
 
+    // Commit MySQL transaction first
     await connection.commit();
+    transactionStarted = false;
+
+    const bookingId = bookingResult.insertId;
+
+    // MongoDB: create activity log and notify equipment owner
+    const mongoOperations = [
+      createActivityLog({
+        userId,
+        action: "BOOKING_CREATED",
+        entityType: "BOOKING",
+        entityId: bookingId,
+        details: {
+          equipmentId,
+          startDate,
+          endDate,
+          rentalDays,
+          totalAmount,
+          status: "pending",
+        },
+      }),
+    ];
+
+    if (equipment.owner_user_id) {
+      mongoOperations.push(
+        createNotification({
+          userId: equipment.owner_user_id,
+          type: "BOOKING_CREATED",
+          title: "New booking request",
+          message: "A renter has requested to book your equipment.",
+          relatedBookingId: bookingId,
+        })
+      );
+    }
+
+    const mongoResults = await Promise.allSettled(
+      mongoOperations
+    );
+
+    mongoResults.forEach((result) => {
+      if (result.status === "rejected") {
+        console.error(
+          "MongoDB booking event failed:",
+          result.reason
+        );
+      }
+    });
 
     return NextResponse.json(
       {
         success: true,
         message: "Booking created successfully.",
         booking: {
-          booking_id: bookingResult.insertId,
+          booking_id: bookingId,
           equipment_id: equipmentId,
           renter_id: renterId,
           start_date: startDate,
@@ -284,7 +351,7 @@ export async function POST(request) {
       { status: 201 }
     );
   } catch (error) {
-    if (connection) {
+    if (connection && transactionStarted) {
       await connection.rollback();
     }
 
@@ -307,6 +374,7 @@ export async function POST(request) {
 // PATCH: Owner confirms or rejects a booking
 export async function PATCH(request) {
   let connection;
+  let transactionStarted = false;
 
   try {
     const currentUser = verifyAuth(request);
@@ -351,20 +419,27 @@ export async function PATCH(request) {
     }
 
     connection = await pool.getConnection();
-    await connection.beginTransaction();
 
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    // Fetch booking, owner and renter details
     const [rows] = await connection.execute(
       `SELECT
           b.booking_id,
           b.equipment_id,
+          b.renter_id,
           b.status,
           e.owner_id,
-          op.user_id AS owner_user_id
+          op.user_id AS owner_user_id,
+          rp.user_id AS renter_user_id
        FROM Booking b
        INNER JOIN Equipment e
          ON b.equipment_id = e.equipment_id
        INNER JOIN Owner_Profile op
          ON e.owner_id = op.owner_id
+       INNER JOIN Renter_Profile rp
+         ON b.renter_id = rp.renter_id
        WHERE b.booking_id = ?
        FOR UPDATE`,
       [bookingId]
@@ -372,6 +447,7 @@ export async function PATCH(request) {
 
     if (rows.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         { success: false, message: "Booking not found." },
@@ -381,8 +457,10 @@ export async function PATCH(request) {
 
     const booking = rows[0];
 
+    // Check whether logged-in user owns the equipment
     if (Number(booking.owner_user_id) !== Number(userId)) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -395,6 +473,7 @@ export async function PATCH(request) {
 
     if (String(booking.status).toLowerCase() !== "pending") {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -405,6 +484,7 @@ export async function PATCH(request) {
       );
     }
 
+    // Update booking status in MySQL
     if (action === "confirm") {
       await connection.execute(
         `UPDATE Booking
@@ -435,7 +515,57 @@ export async function PATCH(request) {
       );
     }
 
+    // Commit MySQL transaction first
     await connection.commit();
+    transactionStarted = false;
+
+    const newStatus =
+      action === "confirm" ? "confirmed" : "cancelled";
+
+    // MongoDB: record activity and notify renter
+    const mongoResults = await Promise.allSettled([
+      createActivityLog({
+        userId,
+        action:
+          action === "confirm"
+            ? "BOOKING_CONFIRMED"
+            : "BOOKING_REJECTED",
+        entityType: "BOOKING",
+        entityId: bookingId,
+        details: {
+          equipmentId: booking.equipment_id,
+          renterId: booking.renter_id,
+          previousStatus: "pending",
+          newStatus,
+        },
+      }),
+
+      createNotification({
+        userId: booking.renter_user_id,
+        type:
+          action === "confirm"
+            ? "BOOKING_CONFIRMED"
+            : "BOOKING_REJECTED",
+        title:
+          action === "confirm"
+            ? "Booking confirmed"
+            : "Booking rejected",
+        message:
+          action === "confirm"
+            ? `Your booking #${bookingId} has been confirmed.`
+            : `Your booking #${bookingId} has been rejected.`,
+        relatedBookingId: bookingId,
+      }),
+    ]);
+
+    mongoResults.forEach((result) => {
+      if (result.status === "rejected") {
+        console.error(
+          "MongoDB booking event failed:",
+          result.reason
+        );
+      }
+    });
 
     return NextResponse.json({
       success: true,
@@ -445,11 +575,11 @@ export async function PATCH(request) {
           : `Booking #${bookingId} rejected successfully.`,
       booking: {
         booking_id: bookingId,
-        status: action === "confirm" ? "confirmed" : "cancelled",
+        status: newStatus,
       },
     });
   } catch (error) {
-    if (connection) {
+    if (connection && transactionStarted) {
       await connection.rollback();
     }
 

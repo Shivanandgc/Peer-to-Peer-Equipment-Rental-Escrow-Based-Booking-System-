@@ -2,6 +2,10 @@
 import { NextResponse } from "next/server";
 import pool from "@/lib/db";
 import { verifyAuth } from "@/lib/auth";
+import {
+  createActivityLog,
+  createNotification,
+} from "@/lib/mongo-helpers";
 
 export const runtime = "nodejs";
 
@@ -41,7 +45,8 @@ export async function GET(request) {
           et.released_at,
           b.status AS booking_status
        FROM Payment p
-       JOIN Booking b ON p.booking_id = b.booking_id
+       JOIN Booking b
+         ON p.booking_id = b.booking_id
        LEFT JOIN Escrow_Transaction et
          ON p.payment_id = et.payment_id
        LEFT JOIN Renter_Profile rp
@@ -67,7 +72,10 @@ export async function GET(request) {
     console.error("Payments API GET error:", error);
 
     return NextResponse.json(
-      { success: false, message: "Could not load payment records." },
+      {
+        success: false,
+        message: "Could not load payment records.",
+      },
       { status: 500 }
     );
   }
@@ -76,6 +84,7 @@ export async function GET(request) {
 // POST: Create payment and automatically create escrow record
 export async function POST(request) {
   let connection;
+  let transactionStarted = false;
 
   try {
     const currentUser = verifyAuth(request);
@@ -92,14 +101,20 @@ export async function POST(request) {
 
     if (!userId || !["renter", "both"].includes(role)) {
       return NextResponse.json(
-        { success: false, message: "Only renters can make payments." },
+        {
+          success: false,
+          message: "Only renters can make payments.",
+        },
         { status: 403 }
       );
     }
 
     const body = await request.json();
+
     const bookingId = Number(body.booking_id);
-    const paymentMethod = String(body.payment_method || "").toLowerCase();
+    const paymentMethod = String(
+      body.payment_method || ""
+    ).toLowerCase();
 
     if (
       !Number.isInteger(bookingId) ||
@@ -116,16 +131,26 @@ export async function POST(request) {
     }
 
     connection = await pool.getConnection();
-    await connection.beginTransaction();
 
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    // Fetch booking, renter and equipment owner details
     const [bookings] = await connection.execute(
       `SELECT
           b.booking_id,
+          b.equipment_id,
           b.total_amount,
           b.status,
-          rp.user_id
+          rp.user_id AS renter_user_id,
+          op.user_id AS owner_user_id
        FROM Booking b
-       JOIN Renter_Profile rp ON b.renter_id = rp.renter_id
+       JOIN Renter_Profile rp
+         ON b.renter_id = rp.renter_id
+       JOIN Equipment e
+         ON b.equipment_id = e.equipment_id
+       JOIN Owner_Profile op
+         ON e.owner_id = op.owner_id
        WHERE b.booking_id = ?
        FOR UPDATE`,
       [bookingId]
@@ -133,6 +158,7 @@ export async function POST(request) {
 
     if (bookings.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         { success: false, message: "Booking not found." },
@@ -142,17 +168,27 @@ export async function POST(request) {
 
     const booking = bookings[0];
 
-    if (Number(booking.user_id) !== Number(userId)) {
+    // Verify that the logged-in user owns this booking
+    if (Number(booking.renter_user_id) !== Number(userId)) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
-        { success: false, message: "You cannot pay for this booking." },
+        {
+          success: false,
+          message: "You cannot pay for this booking.",
+        },
         { status: 403 }
       );
     }
 
-    if (booking.status === "cancelled" || booking.status === "returned") {
+    if (
+      ["cancelled", "returned"].includes(
+        String(booking.status).toLowerCase()
+      )
+    ) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -163,6 +199,7 @@ export async function POST(request) {
       );
     }
 
+    // Prevent duplicate payments
     const [existingPayments] = await connection.execute(
       `SELECT payment_id
        FROM Payment
@@ -173,6 +210,7 @@ export async function POST(request) {
 
     if (existingPayments.length > 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -187,6 +225,7 @@ export async function POST(request) {
 
     if (!Number.isFinite(amount) || amount <= 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         { success: false, message: "Invalid booking amount." },
@@ -194,6 +233,7 @@ export async function POST(request) {
       );
     }
 
+    // Insert payment into MySQL
     const [paymentResult] = await connection.execute(
       `INSERT INTO Payment
         (booking_id, amount, payment_method)
@@ -201,34 +241,80 @@ export async function POST(request) {
       [bookingId, amount, paymentMethod]
     );
 
+    const paymentId = paymentResult.insertId;
+
+    // Calculate platform fee
     const platformFeePercent = 5;
+
     const platformFeeAmount = Number(
       ((amount * platformFeePercent) / 100).toFixed(2)
     );
 
+    // Create escrow record in MySQL
     const [escrowResult] = await connection.execute(
       `INSERT INTO Escrow_Transaction
         (payment_id, status, platform_fee_percent, platform_fee_amount)
        VALUES (?, 'held', ?, ?)`,
       [
-        paymentResult.insertId,
+        paymentId,
         platformFeePercent,
         platformFeeAmount,
       ]
     );
 
+    const escrowId = escrowResult.insertId;
+
+    // Commit MySQL transaction first
     await connection.commit();
+    transactionStarted = false;
+
+    // MongoDB: record payment activity and notify owner
+    const mongoResults = await Promise.allSettled([
+      createActivityLog({
+        userId,
+        action: "PAYMENT_CREATED",
+        entityType: "PAYMENT",
+        entityId: paymentId,
+        details: {
+          bookingId,
+          equipmentId: booking.equipment_id,
+          amount,
+          paymentMethod,
+          escrowId,
+          escrowStatus: "held",
+          platformFeePercent,
+          platformFeeAmount,
+        },
+      }),
+
+      createNotification({
+        userId: booking.owner_user_id,
+        type: "PAYMENT_RECEIVED",
+        title: "Payment received",
+        message: `Payment for booking #${bookingId} has been recorded and is held in escrow.`,
+        relatedBookingId: bookingId,
+      }),
+    ]);
+
+    mongoResults.forEach((result) => {
+      if (result.status === "rejected") {
+        console.error(
+          "MongoDB payment event failed:",
+          result.reason
+        );
+      }
+    });
 
     return NextResponse.json(
       {
         success: true,
         message: "Payment recorded and escrow created successfully.",
         payment: {
-          payment_id: paymentResult.insertId,
+          payment_id: paymentId,
           booking_id: bookingId,
           amount,
           payment_method: paymentMethod,
-          escrow_id: escrowResult.insertId,
+          escrow_id: escrowId,
           escrow_status: "held",
           platform_fee_percent: platformFeePercent,
           platform_fee_amount: platformFeeAmount,
@@ -237,22 +323,31 @@ export async function POST(request) {
       { status: 201 }
     );
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && transactionStarted) {
+      await connection.rollback();
+      transactionStarted = false;
+    }
 
     console.error("Payment creation error:", error);
 
     return NextResponse.json(
-      { success: false, message: "Could not create payment." },
+      {
+        success: false,
+        message: "Could not create payment.",
+      },
       { status: 500 }
     );
   } finally {
-    if (connection) connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 }
 
 // PATCH: Owner confirms return and releases escrow
 export async function PATCH(request) {
   let connection;
+  let transactionStarted = false;
 
   try {
     const currentUser = verifyAuth(request);
@@ -288,8 +383,11 @@ export async function PATCH(request) {
     }
 
     connection = await pool.getConnection();
-    await connection.beginTransaction();
 
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    // Fetch payment, escrow, booking, owner and renter details
     const [rows] = await connection.execute(
       `SELECT
           p.payment_id,
@@ -298,7 +396,8 @@ export async function PATCH(request) {
           b.booking_id,
           b.equipment_id,
           b.status AS booking_status,
-          op.user_id AS owner_user_id
+          op.user_id AS owner_user_id,
+          rp.user_id AS renter_user_id
        FROM Payment p
        JOIN Escrow_Transaction et
          ON p.payment_id = et.payment_id
@@ -308,6 +407,8 @@ export async function PATCH(request) {
          ON b.equipment_id = e.equipment_id
        JOIN Owner_Profile op
          ON e.owner_id = op.owner_id
+       JOIN Renter_Profile rp
+         ON b.renter_id = rp.renter_id
        WHERE p.payment_id = ?
        FOR UPDATE`,
       [paymentId]
@@ -315,17 +416,23 @@ export async function PATCH(request) {
 
     if (rows.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
-        { success: false, message: "Payment or escrow record not found." },
+        {
+          success: false,
+          message: "Payment or escrow record not found.",
+        },
         { status: 404 }
       );
     }
 
     const record = rows[0];
 
+    // Verify equipment ownership
     if (Number(record.owner_user_id) !== Number(userId)) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -338,6 +445,7 @@ export async function PATCH(request) {
 
     if (record.escrow_status !== "held") {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -349,9 +457,12 @@ export async function PATCH(request) {
     }
 
     if (
-      !["confirmed", "ongoing"].includes(record.booking_status)
+      !["confirmed", "ongoing"].includes(
+        String(record.booking_status).toLowerCase()
+      )
     ) {
       await connection.rollback();
+      transactionStarted = false;
 
       return NextResponse.json(
         {
@@ -363,7 +474,7 @@ export async function PATCH(request) {
       );
     }
 
-    // Mark booking as returned
+    // Mark booking as returned in MySQL
     await connection.execute(
       `UPDATE Booking
        SET status = 'returned'
@@ -371,7 +482,7 @@ export async function PATCH(request) {
       [record.booking_id]
     );
 
-    // Release escrow
+    // Release escrow in MySQL
     await connection.execute(
       `UPDATE Escrow_Transaction
        SET status = 'released',
@@ -388,26 +499,73 @@ export async function PATCH(request) {
       [record.equipment_id]
     );
 
+    // Commit MySQL transaction first
     await connection.commit();
+    transactionStarted = false;
+
+    // MongoDB: record escrow release and notify renter
+    const mongoResults = await Promise.allSettled([
+      createActivityLog({
+        userId,
+        action: "ESCROW_RELEASED",
+        entityType: "ESCROW",
+        entityId: record.escrow_id,
+        details: {
+          paymentId,
+          bookingId: record.booking_id,
+          equipmentId: record.equipment_id,
+          previousEscrowStatus: "held",
+          newEscrowStatus: "released",
+          previousBookingStatus: record.booking_status,
+          newBookingStatus: "returned",
+        },
+      }),
+
+      createNotification({
+        userId: record.renter_user_id,
+        type: "ESCROW_RELEASED",
+        title: "Escrow released",
+        message: `Your booking #${record.booking_id} has been marked as returned and its escrow has been released.`,
+        relatedBookingId: record.booking_id,
+      }),
+    ]);
+
+    mongoResults.forEach((result) => {
+      if (result.status === "rejected") {
+        console.error(
+          "MongoDB escrow event failed:",
+          result.reason
+        );
+      }
+    });
 
     return NextResponse.json({
       success: true,
-      message: "Booking marked as returned, escrow released, and equipment made available.",
+      message:
+        "Booking marked as returned, escrow released, and equipment made available.",
       booking_id: record.booking_id,
       payment_id: paymentId,
       escrow_status: "released",
       equipment_availability: "available",
     });
   } catch (error) {
-    if (connection) await connection.rollback();
+    if (connection && transactionStarted) {
+      await connection.rollback();
+      transactionStarted = false;
+    }
 
     console.error("Escrow release error:", error);
 
     return NextResponse.json(
-      { success: false, message: "Could not release escrow." },
+      {
+        success: false,
+        message: "Could not release escrow.",
+      },
       { status: 500 }
     );
   } finally {
-    if (connection) connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 }
